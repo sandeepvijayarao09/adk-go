@@ -17,6 +17,7 @@ package plugininternal
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -85,12 +86,36 @@ func (pm *PluginManager) HasPlugins() bool {
 	return len(pm.plugins) > 0
 }
 
+// callPlugin runs one plugin callback, turning a panic into an error that names
+// the plugin and the callback. A plugin is third-party code, and the run-level
+// callbacks are the ones with no recovery above them: a panic in a tool
+// callback becomes the call's function response through recoverToolPanic, and
+// one in a model callback is turned into an error by the node scheduler, but a
+// panic here unwinds whatever goroutine is draining Runner.Run. adk-python
+// likewise lets no plugin exception escape as itself: _run_callbacks re-raises
+// it as a RuntimeError carrying both names (plugins/plugin_manager.py).
+//
+// The tool and model callbacks are deliberately left alone, because the layers
+// above them already produce the error text their callers match on.
+func callPlugin[T any](p *plugin.Plugin, name string, step func() (T, error)) (result T, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			var zero T
+			result = zero
+			err = fmt.Errorf("plugin %q panicked in %s: %v\nstack: %s", p.Name(), name, r, debug.Stack())
+		}
+	}()
+	return step()
+}
+
 // RunOnUserMessageCallback runs the OnUserMessageCallback for all plugins.
 func (pm *PluginManager) RunOnUserMessageCallback(cctx agent.InvocationContext, userMessage *genai.Content) (*genai.Content, error) {
 	for _, plugin := range pm.plugins {
 		callback := plugin.OnUserMessageCallback()
 		if callback != nil {
-			newContent, err := callback(cctx, userMessage)
+			newContent, err := callPlugin(plugin, "OnUserMessageCallback", func() (*genai.Content, error) {
+				return callback(cctx, userMessage)
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -107,7 +132,9 @@ func (pm *PluginManager) RunBeforeRunCallback(cctx agent.InvocationContext) (*ge
 	for _, plugin := range pm.plugins {
 		callback := plugin.BeforeRunCallback()
 		if callback != nil {
-			newContent, err := callback(cctx)
+			newContent, err := callPlugin(plugin, "BeforeRunCallback", func() (*genai.Content, error) {
+				return callback(cctx)
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -119,13 +146,25 @@ func (pm *PluginManager) RunBeforeRunCallback(cctx agent.InvocationContext) (*ge
 	return nil, nil
 }
 
-// RunAfterRunCallback runs the AfterRunCallback for all plugins.
+// RunAfterRunCallback runs the AfterRunCallback for all plugins. It has no way
+// to report a failure, and every call site reaches it from a defer once the
+// run's answer has already shipped, so a panic is recorded on the span and the
+// remaining plugins still run, as for OnAgentErrorCallback.
 func (pm *PluginManager) RunAfterRunCallback(cctx agent.InvocationContext) {
 	for _, plugin := range pm.plugins {
 		callback := plugin.AfterRunCallback()
-		if callback != nil {
-			callback(cctx)
+		if callback == nil {
+			continue
 		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					trace.SpanFromContext(cctx).RecordError(
+						fmt.Errorf("plugin %q panicked in AfterRunCallback: %v\nstack: %s", plugin.Name(), r, debug.Stack()))
+				}
+			}()
+			callback(cctx)
+		}()
 	}
 }
 
@@ -134,7 +173,9 @@ func (pm *PluginManager) RunOnEventCallback(cctx agent.InvocationContext, event 
 	for _, plugin := range pm.plugins {
 		callback := plugin.OnEventCallback()
 		if callback != nil {
-			newEvent, err := callback(cctx, event)
+			newEvent, err := callPlugin(plugin, "OnEventCallback", func() (*session.Event, error) {
+				return callback(cctx, event)
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -151,7 +192,9 @@ func (pm *PluginManager) RunBeforeAgentCallback(cctx agent.Context) (*genai.Cont
 	for _, plugin := range pm.plugins {
 		callback := plugin.BeforeAgentCallback()
 		if callback != nil {
-			newContent, err := callback(cctx)
+			newContent, err := callPlugin(plugin, "BeforeAgentCallback", func() (*genai.Content, error) {
+				return callback(cctx)
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -168,7 +211,9 @@ func (pm *PluginManager) RunAfterAgentCallback(cctx agent.Context) (*genai.Conte
 	for _, plugin := range pm.plugins {
 		callback := plugin.AfterAgentCallback()
 		if callback != nil {
-			newContent, err := callback(cctx)
+			newContent, err := callPlugin(plugin, "AfterAgentCallback", func() (*genai.Content, error) {
+				return callback(cctx)
+			})
 			if err != nil {
 				return nil, err
 			}
